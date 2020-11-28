@@ -127,7 +127,7 @@ public Action Command_takim_ban(int client, int args)
 	char name[64];
 	GetClientName(client, name, sizeof(name));
 	banatan[target] = name;	
-	GetClientAuthId(client, AuthId_Steam2, steamid, 64);
+	GetClientAuthId(target, AuthId_Steam2, steamid, 64);
 	Handle kv = CreateKeyValues("takimban_database");
 	FileToKeyValues(kv, mydata);
 	KvJumpToKey(kv, steamid, true);
