@@ -1,292 +1,243 @@
+#pragma semicolon 1
+
+#define DEBUG
+
+#define PLUGIN_AUTHOR "alikoc77"
+#define PLUGIN_VERSION "1.00"
+#define ptag "[Takim-Ban]"
+
 #include <sourcemod>
 #include <sdktools>
-#include <cstrike>
 #include <multicolors>
-#pragma semicolon 1 
+#include <cstrike>
+
 #pragma newdecls required
 
-int takim_ban[MAXPLAYERS+1],
-	g_iSpam[MAXPLAYERS + 1];
-Handle takim_bantimer[MAXPLAYERS+1],
+char g_sSQLBuffer[3096],
+	ban_atan[MAXPLAYERS + 1][128],
+	ban_sebep[MAXPLAYERS + 1][128];
+
+Handle g_hDB = null;
+bool g_bIsMySQl;
+
+bool client_team_ban[MAXPLAYERS + 1],
 	g_check_spam[MAXPLAYERS + 1];
-char bansebep[MAXPLAYERS + 1][999];
-char banatan[MAXPLAYERS + 1][64];
-char mydata[PLATFORM_MAX_PATH];
+int ban_miktar[MAXPLAYERS + 1] = 0,
+	g_iSpam[MAXPLAYERS + 1];
 
-ConVar convar_tag;
-char tag1[999];
-
-public Plugin myinfo =
+public Plugin myinfo = 
 {
-    name = "Takım Ban",
-    author = "ali",
-    description = "Basit bir takıma girme süreli engelleme/banlama",
-    version = "1.0",
-    url = "csgo.leaderclan.com"
+	name = "Takım Ban",
+	author = PLUGIN_AUTHOR,
+	description = "Bir oyuncunun takıma girmesini engelleme",
+	version = PLUGIN_VERSION,
+	url = "https://steamcommunity.com/id/alikoc77"
 };
 
-
-public void OnPluginStart()
-{
-	LoadTranslations("common.phrases");
-	RegAdminCmd("sm_takimban", Command_takim_ban, ADMFLAG_BAN);
-	RegAdminCmd("sm_takimunban", Command_CTUnBan, ADMFLAG_BAN);
-	RegAdminCmd("sm_takimbanmi", Command_IsBanned, ADMFLAG_BAN);
+public void OnPluginStart(){
+	RegAdminCmd("sm_takimban", com_takimban, ADMFLAG_BAN);
+	RegAdminCmd("sm_takimunban", com_untakimban, ADMFLAG_BAN);
 	HookEvent("player_team", Event_PlayerTeam, EventHookMode_Pre);
 	AddCommandListener(JoinTeam, "jointeam");
-	convar_tag = CreateConVar("takimban_tag", "SM", "Tagı giriniz");
-	HookConVarChange(convar_tag, CVarChange);
-	GetCVars();
-	BuildPath(Path_SM, mydata, sizeof(mydata), "configs/alispw77/takimban_database.cfg");
-	for (int i = 1; i <= MaxClients; i++){
-		if (IsClientInGame(i)) {
-			OnClientPutInServer(i);
-		}
-	}
+	SQL_TConnect(sql_connect, "takim_bans");
 }
 
 public void OnClientPutInServer(int client){
-	CreateTimer(1.0, Timer_Gettakim_banData, client, TIMER_FLAG_NO_MAPCHANGE);
+	if(valid_client(client)){
+		function_check_client_ban(client);
+	}
+}
+public void OnClientDisconnect(int client){
+	if(!IsFakeClient(client) && client_team_ban[client]){
+		client_team_ban[client] = false;
+		if(g_check_spam[client])g_check_spam[client] = false;
+		ban_miktar[client] = 0;
+		g_iSpam[client] = 0;
+	}
 }
 
-public Action Event_PlayerTeam(Event event, const char[] name, bool dontBroadcast)
-{
-	int client  = GetClientOfUserId(GetEventInt(event, "userid"));
-	if(IsValidClient(client) && takim_ban[client] > 0){
-		if(!event.GetBool("silent"))
+public Action com_takimban(int client, int args){
+	if(valid_client(client)){
+		if(args < 3) 
 		{
-			event.BroadcastDisabled = true;
-			if (IsValidClient(client)){
-				CreateTimer(1.0, Timer_checkteam, client, TIMER_FLAG_NO_MAPCHANGE);
+			CReplyToCommand(client, "{green}Kullanım: sm_takimban [name|#userid] [dakika] [sebep]");
+			return;
+		}
+		char ctarget[32], cminutes[32], csebep[40];
+		GetCmdArg(1, ctarget, sizeof(ctarget));
+		GetCmdArg(2, cminutes, sizeof(cminutes));
+		GetCmdArg(3, csebep, sizeof(csebep));
+		
+		int minutes = StringToInt(cminutes);
+		int target = FindTarget(client, ctarget);
+		if (target == -1)return;
+		if(client_team_ban[target]){
+			CPrintToChat(client, "{darkred}%s {green}Bu oyuncunun takım-ban ı bulunmakta.", ptag);
+			return;
+		}
+		function_save_client_ban(client, target, minutes, csebep);
+		CPrintToChatAll("{darkred}%s {orange}%N {green}adlı oyuncuya, {orange}%N {green}tarafından {orange}%i dakika {green}takım-yasaklanması uygulandı. {orange}[ %s ] {green}sebebiyle.", ptag, target, client, minutes, csebep);
+	}
+}
+public Action com_untakimban(int client, int args){
+	if(valid_client(client)){
+		if(args < 3) 
+		{
+			CReplyToCommand(client, "{green}Kullanım: sm_takimunban [name|#userid]");
+			return;
+		}
+		char ctarget[32];
+		GetCmdArg(1, ctarget, sizeof(ctarget));
+		int target = FindTarget(client, ctarget);
+		if (target == -1)return;
+		if(!client_team_ban[target]){
+			CPrintToChat(client, "{darkred}%s {green}Bu oyuncunun takım-ban ı zaten bulunmamakta.", ptag);
+			return;
+		}
+		function_del_client_ban(target);
+		CPrintToChatAll("{darkred}%s {orange}%N {green}adlı oyuncunun takım-yasaklanması, {orange}%N {green}tarafından kaldırıldı.", ptag, target, client);
+	}
+}
+//sql
+public void sql_connect(Handle owner, Handle hndl, char [] error, any data){
+	if(hndl == null){
+		LogError("Database failure: %s", error);
+		SetFailState("Databases dont work");
+	}
+	else{
+		g_hDB = hndl;
+		SQL_SetCharset(g_hDB, "utf8mb4");
+		SQL_GetDriverIdent(SQL_ReadDriver(g_hDB), g_sSQLBuffer, sizeof(g_sSQLBuffer));
+		g_bIsMySQl = StrEqual(g_sSQLBuffer,"mysql", false) ? true : false;
+		
+		if(g_bIsMySQl)
+		{
+			Format(g_sSQLBuffer, sizeof(g_sSQLBuffer), "CREATE TABLE IF NOT EXISTS `team_bans` (`steamid` varchar(32) PRIMARY KEY NOT NULL, `sebep` varchar(128) NOT NULL, `banlayan` varchar(128) NOT NULL, `ban_time` int(64) NOT NULL)");
+			SQL_TQuery(g_hDB, OnSQLConnectCallback, g_sSQLBuffer, 0);
+		}
+		else{
+			Format(g_sSQLBuffer, sizeof(g_sSQLBuffer), "CREATE TABLE IF NOT EXISTS team_bans (steamid varchar(32) PRIMARY KEY NOT NULL, sebep varchar(128) NOT NULL, banlayan varchar(128) NOT NULL, ban_time int(64) NOT NULL)");
+			SQL_TQuery(g_hDB, OnSQLConnectCallback, g_sSQLBuffer, 0);	
+		}
+	}
+}
+public int OnSQLConnectCallback(Handle owner, Handle hndl, char [] error, any data){
+	if(hndl == null)
+	{
+		LogError("Query failure: %s", error);
+		return;
+	}
+	if(data == 0){
+		for(int client = 1; client <= MaxClients; client++)
+		{
+			if(valid_client(client))
+			{
+				OnClientPutInServer(client);
 			}
 		}
 	}
 }
-
+//functions
+void function_save_client_ban(int client, int target, int minutes, char[] sebep){
+	if (valid_client(target) && valid_client(client)){
+		client_team_ban[target] = true;
+		char query[256], steamid[64], client_name[128];
+		if(!GetClientName(client, client_name, sizeof(client_name))){
+			Format(client_name, sizeof(client_name), "<noname>");
+		}
+		else{
+			GetClientName(client, client_name, sizeof(client_name));
+		}		
+		GetClientAuthId(target, AuthId_Steam2, steamid, sizeof(steamid));
+		Format(query, sizeof(query), "INSERT INTO team_bans(`steamid`, `sebep`, `banlayan`, `ban_time`) VALUES('%s', \"%s\", \"%s\", '%d');", steamid, sebep, client_name, GetTime() + (minutes * 60));
+		SQL_TQuery(g_hDB, SaveSQLPlayerCallback, query, target);
+		client_team_ban[target] = true;
+		ban_miktar[target] = GetTime() + (minutes * 60);
+		if(GetClientTeam(target) != 1)ChangeClientTeam(target, 1);
+	}
+}
+void function_check_client_ban(int client){
+	if (!valid_client(client))return;
+	char steamid[64], query[256];
+	GetClientAuthId(client, AuthId_Steam2, steamid, sizeof(steamid));
+	Format(query, sizeof(query), "SELECT sebep, banlayan, ban_time FROM team_bans WHERE steamid = '%s'", steamid);
+	SQL_TQuery(g_hDB, CheckSQLSteamIDCallback, query, GetClientUserId(client));
+}
+void function_del_client_ban(int client){
+	if (!valid_client(client))return;
+	char steamid[64], query[256];
+	GetClientAuthId(client, AuthId_Steam2, steamid, sizeof(steamid));
+	client_team_ban[client] = false;
+	Format(query, sizeof(query), "DELETE FROM `team_bans` WHERE steamid = '%s';", steamid);
+	SQL_TQuery(g_hDB, SaveSQLPlayerCallback, query, client);
+}
+bool valid_client(int client){
+	return (IsClientInGame(client) && !IsFakeClient(client));
+}
+//sql
+public int SaveSQLPlayerCallback(Handle owner, Handle hndl, char [] error, any data){
+	if(hndl == null)
+	{
+		LogError("Query failure: %s", error);
+	}
+}
+public int CheckSQLSteamIDCallback(Handle owner, Handle hndl, char [] error, any data){
+	int client,
+		ban_time;
+	if((client = GetClientOfUserId(data)) == 0){
+		return;
+	}
+	if(hndl == null){
+		LogError("Query failure: %s", error);
+		return;
+	}
+	if(!SQL_GetRowCount(hndl) || !SQL_FetchRow(hndl)) {
+		function_del_client_ban(client);
+		return;
+	}
+	ban_time = SQL_FetchInt(hndl, 2);
+	if(GetTime() > ban_time){
+		function_del_client_ban(client);
+		return;
+	}
+	SQL_FetchString(hndl, 1, ban_atan[client],sizeof(ban_atan[]));
+	SQL_FetchString(hndl, 0, ban_sebep[client],sizeof(ban_sebep[]));
+	client_team_ban[client] = true;
+}
+//hooks
 public Action JoinTeam(int client, const char[] Command, int ArgumentsCount)
 {
-	if (IsValidClient(client)){
-		CreateTimer(0.1, Timer_checkteam, client, TIMER_FLAG_NO_MAPCHANGE);
-	}
-}
-
-public Action Timer_checkteam(Handle timer, int client)
-{
-	if (IsValidClient(client) && takim_ban[client] > 0){
-		float minutes = takim_ban[client] / 60.0;
-		if (minutes < 1)
-			minutes += 1.0;
+	if (valid_client(client) && client_team_ban[client]){
+		char steamid[64], query[256];
+		GetClientAuthId(client, AuthId_Steam2, steamid, sizeof(steamid));
+		Format(query, sizeof(query), "SELECT sebep, banlayan, ban_time FROM team_bans WHERE steamid = '%s'", steamid);
+		SQL_TQuery(g_hDB, CheckSQLSteamIDCallback, query, GetClientUserId(client));
+		if(GetClientTeam(client) != 1)ChangeClientTeam(client, 1);
+		int minutes = ban_miktar[client] - GetTime();
 		if (g_iSpam[client] < 1){
 			g_iSpam[client]++;
-			CPrintToChat(client, "[%s] {green}Takıma Girişin {orange}%.0f {green}Dakikalığına Yasaklandı.[Sebep: {orange}%s{green}]", tag1, minutes, bansebep[client]);
+			g_check_spam[client] = true;
+			CPrintToChat(client, "{darkred}%s {green}Takıma Girişin {orange}%i {green}saniyeliğine Yasaklandı.[Sebep: {orange}%s{green}]", ptag, minutes, ban_sebep[client]);
 		}
-		if (!g_check_spam[client])g_check_spam[client] = CreateTimer(3.0, Timer_CheckSpam, client, TIMER_FLAG_NO_MAPCHANGE);
-		ChangeClientTeam(client, 1);
-	}	
+		if (g_check_spam[client])CreateTimer(3.0, Timer_CheckSpam, client, TIMER_FLAG_NO_MAPCHANGE);		
+		return Plugin_Handled;
+	}
 	return Plugin_Continue;
 }
-
-public Action Timer_CheckSpam(Handle Timer, int client)
+public Action Event_PlayerTeam(Event event, const char[] name, bool dontBroadcast)
+{
+	int client  = GetClientOfUserId(GetEventInt(event, "userid"));
+	if (valid_client(client) && client_team_ban[client]){
+		if(!event.GetBool("silent"))
+		{
+			event.BroadcastDisabled = true;
+		}
+	}
+}
+//timers
+public Action Timer_CheckSpam(Handle Timer, any client)
 {
 	g_iSpam[client] = 0;
-	delete g_check_spam[client];
+	g_check_spam[client] = false;
 	return Plugin_Continue;
-}
-
-public Action Timer_Gettakim_banData(Handle timer, int client)
-{
-    Gettakim_banData(client);
-    return Plugin_Continue;
-}
-
-public Action Command_takim_ban(int client, int args)
-{
-	if(args < 3) 
-	{
-		CReplyToCommand(client, "{green}Kullanım: sm_takimban [name|#userid] [dakika] [sebep]");
-		return Plugin_Handled;
-	}
-	
-	char arg1[32], arg2[32], arg3[40];
-	
-	GetCmdArg(1, arg1, sizeof(arg1));
-	GetCmdArg(2, arg2, sizeof(arg2));
-	GetCmdArg(3, arg3, sizeof(arg3));
-	
-	int minutes = StringToInt(arg2);
-	int target = FindTarget(client, arg1);
-	if (target == -1) return Plugin_Handled;
-	
-	if(takim_ban[target] > 0)
-	{
-		CPrintToChat(client, "[%s] {orange}%N{green} oyuncunun zaten bir takım yasaklanması bulunmakta.[Atan: {orange}%s{green}][Sebep: {orange}%s{green}]", tag1, target, banatan[target], bansebep[target]);
-		return Plugin_Handled;
-	}
-	char steamid[64];
-	bansebep[target] = arg3;
-	char name[64];
-	GetClientName(client, name, sizeof(name));
-	banatan[target] = name;	
-	GetClientAuthId(target, AuthId_Steam2, steamid, 64);
-	Handle kv = CreateKeyValues("takimban_database");
-	FileToKeyValues(kv, mydata);
-	KvJumpToKey(kv, steamid, true);
-	KvSetString(kv, "takim_ban_time", arg2);
-	KvSetString(kv, "Yasaklayan", name);
-	KvSetString(kv, "Sebep", arg3);
-	KvRewind(kv);
-	KeyValuesToFile(kv, mydata);
-	CloseHandle(kv);	
-	takim_ban[target] = minutes * 60;
-	takim_bantimer[target] = CreateTimer(1.0, Timer_TakimBan, target, TIMER_REPEAT);
-	
-	if (GetClientTeam(target) == 3 || GetClientTeam(target) == 2)
-	{
-		ChangeClientTeam(target, 1);
-		ForcePlayerSuicide(target);
-	}
-	
-	CPrintToChatAll("[%s] {orange}%N {green}adlı oyuncuya, {orange}%N {green}tarafından {orange}%s dakika {green}takım-yasaklanması uygulandı. {orange}[ %s ] {green}sebebiyle.", tag1, client, target, arg2, arg3);
-	return Plugin_Continue;
-}
-
-public Action Command_CTUnBan(int client, int args)
-{
-    if(args < 1) 
-    {
-        CReplyToCommand(client, "{green}Kullanım: sm_takimunban [name|#userid]");
-        return Plugin_Handled;
-    }
-    
-    char arg1[32];
-
-    GetCmdArg(1, arg1, sizeof(arg1));
-    int target = FindTarget(client, arg1);
-    if (target == -1) return Plugin_Handled;
-    
-    if(takim_ban[target] < 1)
-    {
-        CPrintToChat(client, "[%s] {orange}%N {green}adlı oyuncunun zaten bir takım-yasaklanması bulunmamakta", tag1, target);
-        return Plugin_Handled;
-    }
-    takim_ban[target] = 0;
-    CPrintToChatAll("[%s] {orange}%N {green}adlı oyuncunun takım-yasaklanması, {orange}%N {green}tarafından kaldırıldı.", tag1, target, client);
-    delete takim_bantimer[target];
-    Updatetakim_banData(target);
-    return Plugin_Continue;
-}
-
-public Action Timer_TakimBan(Handle timer, int client)
-{
-    if (!takim_bantimer[client])
-    	return Plugin_Stop;
-    	
-    if(takim_ban[client] < 1)
-    {
-        takim_ban[client] = 0;
-        delete takim_bantimer[client];
-        
-        return Plugin_Stop;
-    }  
-    takim_ban[client]--;
-    Updatetakim_banData(client);
-    return Plugin_Continue;
-}
-
-public void OnClientDisconnect(int client)
-{
-    if (takim_bantimer[client])
-    {
-        delete (takim_bantimer[client]);
-    }
-}
-
-public Action Command_IsBanned(int client, int args)
-{
-    if(args < 1) 
-    {
-        CReplyToCommand(client, "{green}Kullanım: sm_takimbanmi [name|#userid]");
-        return Plugin_Handled;
-    }
-    
-    char arg1[32];
-    GetCmdArg(1, arg1, sizeof(arg1));
-    int target = FindTarget(client, arg1);
-    if (target == -1) return Plugin_Handled;
-    
-    int minutes = takim_ban[client] / 60;
-    minutes++;
-    
-    if(takim_ban[target] < 1)
-        CPrintToChat(client, "[%s] {green}%N adlı oyuncunun takım-yasaklanması bulunmamakta.", tag1, target);
-    else CPrintToChat(client, "[%s] {green}%N adlı oyuncunun {orange}%.1d {green}dakika takım-yasaklanması bulunmakta.", tag1, target, minutes);
-    
-    return Plugin_Continue;
-}
-
-void Updatetakim_banData(int client)
-{
-	char buffer[PLATFORM_MAX_PATH], steamauth[50];
-	GetClientAuthId(client, AuthId_Steam2, steamauth, sizeof(steamauth));
-	Format(buffer, sizeof(buffer), "%d", takim_ban[client]);
-	Handle kv = CreateKeyValues("takimban_database");
-	FileToKeyValues(kv, mydata);	
-	KvJumpToKey(kv, steamauth);
-	KvSetString(kv, "takim_ban_time", buffer);
-	
-	int length = StringToInt(buffer);
-	if (length <= 0)
-		KvDeleteThis(kv);
-	
-	KvRewind(kv);
-	KeyValuesToFile(kv, mydata);
-	CloseHandle(kv);	
-}
-
-void Gettakim_banData(int client)
-{
-	char sUserID[50];
-	GetClientAuthId(client, AuthId_Steam2, sUserID, sizeof(sUserID));
-	
-	Handle kv = CreateKeyValues("takimban_database");
-	FileToKeyValues(kv, mydata);
-	if (KvJumpToKey(kv, sUserID, false))
-	{
-		char sTimeLeft[20];
-		KvGetString(kv, "takim_ban_time", sTimeLeft, sizeof(sTimeLeft));
-		
-		if (StringToInt(sTimeLeft) > 0){
-			takim_ban[client] = StringToInt(sTimeLeft);
-			KvGetString(kv, "Yasaklayan", banatan[client], sizeof(banatan));
-			KvGetString(kv, "Sebep", bansebep[client], sizeof(bansebep));
-			if(!takim_bantimer[client])
-				takim_bantimer[client] = CreateTimer(1.0, Timer_TakimBan, client, TIMER_REPEAT);
-		}				
-		else{
-			takim_ban[client] = 0;
-			if (takim_bantimer[client])delete takim_bantimer[client];
-		}
-	}
-	else
-	{
-		takim_ban[client] = 0;
-		if (takim_bantimer[client])delete takim_bantimer[client];
-	}
-	CloseHandle(kv);
-}
-
-bool IsValidClient(int client) 
-{
-    if (!( 1 <= client <= MaxClients ) || !IsClientInGame(client)) 
-        return false; 
-     
-    return true; 
-}
-
-public void CVarChange(Handle convar_hndl, const char[] oldValue, const char[] newValue) {
-	GetCVars();
-}
-
-public void GetCVars() {
-	GetConVarString(convar_tag, tag1, sizeof(tag1));
 }
